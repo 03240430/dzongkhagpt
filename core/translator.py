@@ -6,6 +6,8 @@ from .glossary import lookup
 EN = "eng_Latn"
 DZ = "dzo_Tibt"
 
+_CACHE: dict = {}      # (sentence, src, tgt) -> translation
+
 
 def contains_dzongkha(text: str) -> bool:
     """True if the text has any Tibetan-script characters."""
@@ -23,13 +25,24 @@ def clean_dzongkha(text: str) -> str:
 
 @lru_cache(maxsize=1)
 def _load():
-    """Loads the translator once (slow the first time)."""
-    from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+    """Loads the fast translator once."""
+    import ctranslate2
+    from transformers import AutoTokenizer
 
+    if not config.NLLB_CT2_DIR.exists():
+        raise RuntimeError(
+            f"Converted model not found at {config.NLLB_CT2_DIR}. "
+            "Run the ct2-transformers-converter command from the instructions."
+        )
+    translator = ctranslate2.Translator(
+        str(config.NLLB_CT2_DIR),
+        device="cpu",
+        compute_type="int8",
+        inter_threads=1,
+        intra_threads=config.CPU_THREADS,
+    )
     tokenizer = AutoTokenizer.from_pretrained(config.NLLB_MODEL)
-    model = AutoModelForSeq2SeqLM.from_pretrained(config.NLLB_MODEL)
-    model.eval()
-    return tokenizer, model
+    return translator, tokenizer
 
 
 def _split_sentences(line: str, lang: str) -> list[str]:
@@ -40,43 +53,89 @@ def _split_sentences(line: str, lang: str) -> list[str]:
     return [p.strip() for p in parts if p.strip()]
 
 
-@lru_cache(maxsize=512)
-def _translate_piece(text: str, src: str, tgt: str) -> str:
-    """Translate one sentence. Cached: the same sentence is never translated twice."""
-    override = lookup(text, src)               # glossary wins over the AI translator
-    if override:
-        return override
-
-    import torch
-
-    tokenizer, model = _load()
+def _run_model(sentences: list[str], src: str, tgt: str) -> list[str]:
+    """Translate many sentences in one batch."""
+    translator, tokenizer = _load()
     tokenizer.src_lang = src
-    inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=200)
-    max_new = int(inputs["input_ids"].shape[1] * 2) + 20
-    with torch.no_grad():
-        output = model.generate(
-            **inputs,
-            forced_bos_token_id=tokenizer.convert_tokens_to_ids(tgt),
-            num_beams=1,
-            do_sample=False,
-            max_new_tokens=max_new,
+    sources = [
+        tokenizer.convert_ids_to_tokens(
+            tokenizer.encode(s, truncation=True, max_length=200)
         )
-    result = tokenizer.batch_decode(output, skip_special_tokens=True)[0].strip()
-    return clean_dzongkha(result) if tgt == DZ else result
+        for s in sentences
+    ]
+    longest = max(len(s) for s in sources)
+    results = translator.translate_batch(
+        sources,
+        target_prefix=[[tgt]] * len(sources),
+        beam_size=config.CT2_BEAM,
+        max_decoding_length=min(300, longest * 2 + 20),
+        max_batch_size=16,
+    )
+    outputs = []
+    for r in results:
+        tokens = r.hypotheses[0][1:]          # drop the language tag
+        ids = tokenizer.convert_tokens_to_ids(tokens)
+        outputs.append(tokenizer.decode(ids, skip_special_tokens=True).strip())
+    return outputs
 
 
-def translate(text: str, src: str, tgt: str, on_progress=None) -> str:
-    """Translate line by line, sentence by sentence.
-    on_progress(done, total) is called after each sentence (optional)."""
-    work = []
+def _translate_many(sentences: list[str], src: str, tgt: str) -> list[str]:
+    """Glossary first, then cache, then the model (one batch for everything left)."""
+    results = [None] * len(sentences)
+    todo: dict[str, list[int]] = {}
+
+    for i, s in enumerate(sentences):
+        key = (s, src, tgt)
+        if key in _CACHE:
+            results[i] = _CACHE[key]
+            continue
+        override = lookup(s, src)                  # your verified glossary wins
+        if override:
+            _CACHE[key] = override
+            results[i] = override
+            continue
+        todo.setdefault(s, []).append(i)
+
+    if todo:
+        unique = list(todo)
+        for s, out in zip(unique, _run_model(unique, src, tgt)):
+            if tgt == DZ:
+                out = clean_dzongkha(out)
+            _CACHE[(s, src, tgt)] = out
+            for i in todo[s]:
+                results[i] = out
+    return results
+
+
+def translate(text: str, src: str, tgt: str) -> str:
+    """Translate text, keeping line breaks."""
     lines = [l.strip() for l in text.splitlines() if l.strip()]
-    for i, line in enumerate(lines):
-        for s in _split_sentences(line, src):
-            work.append((i, s))
+    per_line = [_split_sentences(l, src) for l in lines]
+    flat = [s for sents in per_line for s in sents]
+    translated = _translate_many(flat, src, tgt)
 
-    results = [[] for _ in lines]
-    for done, (i, sentence) in enumerate(work, start=1):
-        results[i].append(_translate_piece(sentence, src, tgt))
-        if on_progress:
-            on_progress(done, len(work))
-    return "\n".join(" ".join(r) for r in results)
+    out, k = [], 0
+    for sents in per_line:
+        out.append(" ".join(translated[k:k + len(sents)]))
+        k += len(sents)
+    return "\n".join(out)
+
+
+def _content_words(text: str) -> set:
+    return {w for w in re.findall(r"[a-z0-9']+", text.lower()) if len(w) > 3}
+
+
+def translate_checked(text: str) -> list[dict]:
+    """English -> Dzongkha, then back to English to estimate quality.
+    Returns [{"en": ..., "dz": ..., "score": 0..1}]. Score = share of the
+    original's main words that survive the round trip (a rough guide only)."""
+    sentences = [s for l in text.splitlines() for s in _split_sentences(l.strip(), EN)]
+    dz = _translate_many(sentences, EN, DZ)
+    back = _translate_many(dz, DZ, EN)
+
+    rows = []
+    for en, d, b in zip(sentences, dz, back):
+        original = _content_words(en)
+        score = 1.0 if not original else len(original & _content_words(b)) / len(original)
+        rows.append({"en": en, "dz": d, "score": score})
+    return rows
