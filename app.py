@@ -1,87 +1,36 @@
 import streamlit as st
-from core.chat_engine import ChatSession
 
-st.set_page_config(page_title="DzongkhaGPT", page_icon="🇧🇹")
-st.title("DzongkhaGPT: Chat (test version)")
-st.caption("Dzongkha is machine-translated and may contain mistakes. "
-           "Please check important answers with a Dzongkha speaker.")
+from ui import theme
 
-
-@st.cache_resource(show_spinner="Loading the Dzongkha translator (first start only)...")
-def warm_up():
-    from core.translator import _load
-    _load()
-    return True
+st.set_page_config(page_title="DzongkhaGPT", page_icon="🏔️", layout="wide")
+theme.inject_css()
+theme.set_logo()
 
 
-try:
-    warm_up()
-except Exception as e:
-    st.error(f"The translator is not ready: {e}")
-    st.stop()
+def summarize_page():
+    theme.coming_soon("📝", "Summarize Text",
+                      "Paste English or Dzongkha text and get a short, medium or detailed summary.")
 
 
-def show_flags(flags):
-    if flags:
-        st.warning(
-            "These sentences may not be translated well. Please check them:\n\n"
-            + "\n".join(f"- {f}" for f in flags)
-        )
+def documents_page():
+    theme.coming_soon("📄", "Documents",
+                      "Upload PDF, DOCX or TXT files and get one summary per file, plus an optional combined one.")
 
 
-if "session" not in st.session_state:
-    st.session_state.session = ChatSession()
-    st.session_state.shown = []
+def history_page():
+    theme.coming_soon("🕘", "History",
+                      "Review earlier chats and delete them whenever you like.")
 
-lang_choice = st.radio("Answer language", ["Dzongkha", "English"], horizontal=True)
-verify = st.checkbox("Check translation quality (slower)", value=False)
 
-if st.button("Clear chat"):
-    st.session_state.session.clear()
-    st.session_state.shown = []
+pages = [
+    st.Page("views/home.py", title="Home", icon="🏠", default=True),
+    st.Page("views/chat.py", title="AI Chat", icon="💬"),
+    st.Page(summarize_page, title="Summarize Text", icon="📝", url_path="summarize"),
+    st.Page(documents_page, title="Documents", icon="📄", url_path="documents"),
+    st.Page(history_page, title="History", icon="🕘", url_path="history"),
+    st.Page("views/about.py", title="About", icon="ℹ️"),
+]
 
-for m in st.session_state.shown:
-    with st.chat_message(m["role"]):
-        st.write(m["text"])
-        show_flags(m.get("flags"))
-        if m.get("english") and m["english"] != m["text"]:
-            with st.expander("Show English original"):
-                st.write(m["english"])
-        if m.get("timing"):
-            st.caption(m["timing"])
-
-prompt = st.chat_input("Type in English or Dzongkha...")
-if prompt:
-    st.session_state.shown.append({"role": "user", "text": prompt})
-    with st.chat_message("user"):
-        st.write(prompt)
-
-    with st.chat_message("assistant"):
-        english_box = st.empty()
-        status = st.status("Working...", expanded=True)
-        try:
-            result = st.session_state.session.ask(
-                prompt,
-                "dz" if lang_choice == "Dzongkha" else "en",
-                verify=verify,
-                on_step=lambda msg: status.write(msg),
-                on_english=lambda t: english_box.info(f"English draft (Dzongkha coming...): {t}"),
-            )
-            english_box.empty()
-            status.update(label="Done", state="complete", expanded=False)
-            timing = f"AI: {result['t_ai']:.1f}s | Translation: {result['t_translate']:.1f}s"
-            st.write(result["reply"])
-            show_flags(result["flags"])
-            if result["english"] != result["reply"]:
-                with st.expander("Show English original"):
-                    st.write(result["english"])
-            st.caption(timing)
-            st.session_state.shown.append({
-                "role": "assistant", "text": result["reply"],
-                "english": result["english"], "timing": timing,
-                "flags": result["flags"],
-            })
-        except Exception as e:
-            english_box.empty()
-            status.update(label="Something went wrong", state="error")
-            st.error(f"{e}")
+page = st.navigation(pages)
+theme.sidebar_status()
+page.run()
