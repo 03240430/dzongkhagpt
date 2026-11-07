@@ -21,3 +21,6 @@ CT2_BEAM = int(os.getenv("CT2_BEAM", "2"))            # 1 = fastest, 4 = most ca
 CPU_THREADS = int(os.getenv("CPU_THREADS", str(max(1, (os.cpu_count() or 4) // 2))))
 
 MAX_HISTORY_TURNS = 10   # how many past messages the AI remembers
+
+MAX_INPUT_CHARS = int(os.getenv("MAX_INPUT_CHARS", "30000"))   # longest text to summarize
+CHUNK_WORDS = int(os.getenv("CHUNK_WORDS", "600"))                # words per part for long texts

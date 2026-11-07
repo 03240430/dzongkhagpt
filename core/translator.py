@@ -6,7 +6,11 @@ from .glossary import lookup
 EN = "eng_Latn"
 DZ = "dzo_Tibt"
 
-_CACHE: dict = {}      # (sentence, src, tgt) -> translation
+MAX_WORDS_PER_PIECE = 45     # longer English sentences are cut at commas
+MAX_TIBETAN_CHARS = 220      # longer Dzongkha sentences are cut at spaces or tsheg
+BATCH = 24                   # sentences translated per model call
+
+_CACHE: dict = {}            # (sentence, src, tgt) -> translation
 
 
 def contains_dzongkha(text: str) -> bool:
@@ -16,8 +20,8 @@ def contains_dzongkha(text: str) -> bool:
 
 def clean_dzongkha(text: str) -> str:
     """Make sure a Dzongkha sentence ends with the proper sentence mark །"""
-    text = re.sub(r"\s+།", "།", text.strip())    # no space before །
-    text = re.sub(r"[.?!]+$", "།", text)           # swap Latin end marks
+    text = re.sub(r"\s+།", "།", text.strip())
+    text = re.sub(r"[.?!]+$", "།", text)
     if text and not text.endswith("།"):
         text += "།"
     return text
@@ -51,6 +55,55 @@ def _split_sentences(line: str, lang: str) -> list[str]:
     else:
         parts = re.split(r"(?<=[.!?])\s+", line)
     return [p.strip() for p in parts if p.strip()]
+
+
+def _chop_english(sentence: str) -> list[str]:
+    """Cut a very long English sentence into pieces the model will not truncate."""
+    if len(sentence.split()) <= MAX_WORDS_PER_PIECE:
+        return [sentence]
+    pieces, cur = [], []
+    for part in re.split(r"(?<=[,;:])\s+", sentence):
+        words = part.split()
+        if cur and len(cur) + len(words) > MAX_WORDS_PER_PIECE:
+            pieces.append(" ".join(cur))
+            cur = []
+        cur.extend(words)
+        while len(cur) > MAX_WORDS_PER_PIECE:
+            pieces.append(" ".join(cur[:MAX_WORDS_PER_PIECE]))
+            cur = cur[MAX_WORDS_PER_PIECE:]
+    if cur:
+        pieces.append(" ".join(cur))
+    return pieces
+
+
+def _chop_dzongkha(sentence: str) -> list[str]:
+    """Cut a very long Dzongkha sentence at a space, or else at a tsheg (་)."""
+    if len(sentence) <= MAX_TIBETAN_CHARS:
+        return [sentence]
+    pieces, rest = [], sentence
+    while len(rest) > MAX_TIBETAN_CHARS:
+        cut = rest.rfind(" ", 0, MAX_TIBETAN_CHARS)
+        if cut < MAX_TIBETAN_CHARS // 2:
+            cut = rest.rfind("་", 0, MAX_TIBETAN_CHARS)
+        if cut <= 0:
+            cut = MAX_TIBETAN_CHARS - 1
+        pieces.append(rest[:cut + 1].strip())
+        rest = rest[cut + 1:]
+    if rest.strip():
+        pieces.append(rest.strip())
+    return pieces
+
+
+def _join_pieces(pieces: list[str], tgt: str) -> str:
+    """Put the translated pieces of one sentence back together."""
+    if len(pieces) == 1:
+        return pieces[0]
+    fixed = []
+    for i, p in enumerate(pieces):
+        if tgt == DZ and i < len(pieces) - 1 and p.endswith("།"):
+            p = p[:-1].rstrip()          # no sentence end in the middle of a sentence
+        fixed.append(p)
+    return " ".join(fixed)
 
 
 def _run_model(sentences: list[str], src: str, tgt: str) -> list[str]:
@@ -107,12 +160,32 @@ def _translate_many(sentences: list[str], src: str, tgt: str) -> list[str]:
     return results
 
 
-def translate(text: str, src: str, tgt: str) -> str:
-    """Translate text, keeping line breaks."""
+def _translate_sentences(sentences: list[str], src: str, tgt: str, on_progress=None) -> list[str]:
+    """Translate a list of sentences. Very long ones are cut into pieces first."""
+    chop = _chop_english if src == EN else _chop_dzongkha
+    groups = [chop(s) for s in sentences]
+    flat = [p for g in groups for p in g]
+
+    translated = []
+    for i in range(0, len(flat), BATCH):
+        translated.extend(_translate_many(flat[i:i + BATCH], src, tgt))
+        if on_progress:
+            on_progress(min(i + BATCH, len(flat)), len(flat))
+
+    results, k = [], 0
+    for g in groups:
+        results.append(_join_pieces(translated[k:k + len(g)], tgt))
+        k += len(g)
+    return results
+
+
+def translate(text: str, src: str, tgt: str, on_progress=None) -> str:
+    """Translate text, keeping line breaks.
+    on_progress(done, total) is called after each batch (optional)."""
     lines = [l.strip() for l in text.splitlines() if l.strip()]
     per_line = [_split_sentences(l, src) for l in lines]
     flat = [s for sents in per_line for s in sents]
-    translated = _translate_many(flat, src, tgt)
+    translated = _translate_sentences(flat, src, tgt, on_progress)
 
     out, k = [], 0
     for sents in per_line:
@@ -130,8 +203,8 @@ def translate_checked(text: str) -> list[dict]:
     Returns [{"en": ..., "dz": ..., "score": 0..1}]. Score = share of the
     original's main words that survive the round trip (a rough guide only)."""
     sentences = [s for l in text.splitlines() for s in _split_sentences(l.strip(), EN)]
-    dz = _translate_many(sentences, EN, DZ)
-    back = _translate_many(dz, DZ, EN)
+    dz = _translate_sentences(sentences, EN, DZ)
+    back = _translate_sentences(dz, DZ, EN)
 
     rows = []
     for en, d, b in zip(sentences, dz, back):
